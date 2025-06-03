@@ -1,0 +1,21 @@
+
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dv-flow-mgr"
+version = "1.9.0"
+dependencies = [
+    'dv-flow-mgr',
+]
+authors = [
+    {name = "Matthew Ballance", email = "matt.ballance@gmail.com"},
+]
+description = "DV Flow Manager is a build system for silicon design"
+license = {file = "LICENSE" }
+
+[project.entry-points."dv_flow.mgr"]
+cmake = "dv_flow.cmake.__ext__"
+
+
