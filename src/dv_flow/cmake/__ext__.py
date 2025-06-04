@@ -1,9 +1,14 @@
+import argparse
 import asyncio
 import os
 import importlib
 import json
 import re
 import sys
+import http.server
+import socket
+import socketserver
+import threading
 from dv_flow.mgr import PackageLoader, TaskGraphBuilder, TaskDataInput, TaskRunCtxt
 
 def parse_with_string(with_str):
@@ -62,14 +67,10 @@ def mk_run_spec_cmd(args):
 
     loader = PackageLoader()
 
-    print("mk-run-spec-cmd: %s" % args.spec)
-
     # Parse the with string if present
     with_params = {}
     if "with" in spec_data:
         with_params = parse_with_string(spec_data["with"])
-
-    print("with_params: %s" % with_params)
 
     builder = TaskGraphBuilder(root_pkg=None, rundir=spec_data["rundir"], loader=loader)
     # Pass with parameters directly to mkTaskNode
@@ -81,13 +82,10 @@ def mk_run_spec_cmd(args):
         "srcdir": spec_data["srcdir"],
     }
 
-    print("task: %s" % type(node.task).__qualname__)
     run_json["inputs"] = spec_data["needs"].split(';')
     run_json["params"] = node.params.model_dump()
     run_json["run"] = "%s.%s" % (type(node.task).__module__, type(node.task).__name__)
     run_json["run-args"] = node.task.model_dump()
-
-    print("params: %s" % str(node.params.model_dump()))
 
     with open(args.output, 'w') as output_file:
         json.dump(run_json, output_file, indent=4)
@@ -96,8 +94,6 @@ def mk_run_spec_cmd(args):
 #    print("node: %s" % node)
 
 def run_spec_cmd(args):
-    print("run_spec_cmd: %s" % args.run_spec)
-
     with open(args.run_spec, 'r') as run_spec_file:
         run_spec_data = json.load(run_spec_file)
 
@@ -106,8 +102,6 @@ def run_spec_cmd(args):
 
     mod = importlib.import_module(run_module)
     cls = getattr(mod, run_cls)
-
-    print("run_module: %s" % run_module)
 
     task = cls(**run_spec_data["run-args"])
 
@@ -142,11 +136,7 @@ def run_spec_cmd(args):
         None, 
         run_spec_data["rundir"])
 
-    print("task: %s" % type(task).__qualname__)
-
     result = asyncio.run(task(ctxt, input))
-
-    print("result: %s" % result)
 
     result_file = "%s.json" % os.path.join(
         run_spec_data["rundir"],
@@ -162,6 +152,89 @@ def run_spec_cmd(args):
 def share_dir_cmd(args):
     cmake_dir = os.path.dirname(__file__)
     print(os.path.join(cmake_dir, "share"))
+
+class MyHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+    def do_POST(self):
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length)
+
+        data = json.loads(post_data.decode())
+
+        if "command" in data.keys():
+            cmd = data["command"].split()
+
+            if cmd[0] == "cmake-mk-run-spec":
+                class Args:
+                    def __init__(self, **kwargs):
+                        self.__dict__.update(kwargs)
+                argv = {}
+                argv["spec"] = cmd[1]
+                argv["output"] = cmd[3]
+                args = Args(**argv)
+                mk_run_spec_cmd(args)
+
+
+        # Send a response
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'POST request received')
+
+def cmake_config_cmd(args):
+    import subprocess
+
+    builddir = args.builddir or "build"
+    srcdir = args.srcdir or "."
+
+    srcdir = os.path.abspath(srcdir)
+    builddir = os.path.abspath(builddir)
+
+    if not os.path.exists(builddir):
+        os.makedirs(builddir)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(('localhost', 0))
+    PORT = sock.getsockname()[1]
+    sock.close()
+
+    httpd = socketserver.TCPServer(("", PORT), MyHandler)
+
+    def run_server():
+        httpd.serve_forever()
+    
+    env = os.environ.copy()
+    env["DFM_PORT"] = str(PORT)
+
+    server = threading.Thread(target=run_server, daemon=True)
+    server.start()
+
+    cmd = ["cmake", "-S", srcdir, "-B", builddir]
+
+    for gen in args.G or []:
+        cmd.append("-G%s" % gen)
+    for d in args.D or []:
+        cmd.append("-D%s" % d)
+
+    print("Running cmake config: %s" % ' '.join(cmd))
+    
+    result = subprocess.run(
+        cmd, 
+        cwd=builddir,
+        env=env)
+
+    httpd.shutdown()
+    server.join()
+
+    
+    if result.returncode != 0:
+        print("CMake configuration failed with exit code %d" % result.returncode)
+        sys.exit(result.returncode)
+    
+    print("CMake configuration completed successfully.")
+
+
 
 def dfm_add_utilcmd(subparsers):
     mk_run_spec = subparsers.add_parser('cmake-mk-run-spec', 
@@ -180,3 +253,23 @@ def dfm_add_subcmd(subparsers):
     cmake_share_dir = subparsers.add_parser('cmake-share-dir',
                                             help='Display the cmake share directory')
     cmake_share_dir.set_defaults(func=share_dir_cmd)
+
+    class MatchPrefix(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            name = option_string.lstrip('-')
+            if not hasattr(namespace, name) or getattr(namespace, name) is None:
+                setattr(namespace, name, [])
+            getattr(namespace, name).append(values)
+            print("option_string: %s (%s)" % (option_string, values), flush=True)
+
+    cmake_config = subparsers.add_parser('cmake-config',
+                                         help='Configure a cmake project')
+    cmake_config.add_argument("-B", "--builddir", help="CMake build directory")
+    cmake_config.add_argument("-S", "--srcdir", help="CMake source directory")
+    cmake_config.add_argument("-D", 
+                              action=MatchPrefix,
+                              help="CMake defines")
+    cmake_config.add_argument("-G", 
+                              action=MatchPrefix,
+                              help="CMake generator type")
+    cmake_config.set_defaults(func=cmake_config_cmd)

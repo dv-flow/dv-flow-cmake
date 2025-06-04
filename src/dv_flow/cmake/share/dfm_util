@@ -1,0 +1,17 @@
+#!/bin/bash
+
+if test -z "$DFM_PORT"; then
+  DFM=$(echo ${DFM} | sed -e 's/;/ /g')
+  ${DFM} util "$@"
+  code=$?
+else
+  data='{"command": "'"$@"'"}'
+  curl -s -H 'Content-Type: application/json' \
+     -H "Authorization: Bearer ${DFM_PORT}" \
+     -X POST http://localhost:${DFM_PORT}/dfm/util \
+     -d "$data" > /dev/null 2>&1
+  code=0
+fi
+
+
+exit $code
